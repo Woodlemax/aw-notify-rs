@@ -181,7 +181,7 @@ pub enum PomodoroState {
     Interrupted,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum PhaseKind {
     Focus,
@@ -189,7 +189,7 @@ pub enum PhaseKind {
     LongBreak,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct PhaseView {
     pub kind: PhaseKind,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -252,7 +252,7 @@ impl StateResponse {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum PauseReasonView {
     Manual,

@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::model::CategoryPath;
+use crate::model::{CategoryPath, PauseReasonView, PhaseView};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ActivityObservation {
@@ -29,13 +29,65 @@ impl ActivityObservation {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum PomodoroEvent {
     DistractionWarning {
+        session_id: String,
         sequence: u64,
         #[serde(skip_serializing_if = "Option::is_none")]
         current_category: Option<CategoryPath>,
         remaining_milliseconds: u64,
+        notifications: PomodoroNotificationOptions,
     },
-    AfkPaused,
-    MonitoringUnavailablePaused,
+    PhaseCompleted {
+        session_id: String,
+        completed: PhaseView,
+        next: PhaseView,
+        notifications: PomodoroNotificationOptions,
+    },
+    SessionCompleted {
+        session_id: String,
+        focus_intervals: u32,
+        notifications: PomodoroNotificationOptions,
+    },
+    AfkPaused {
+        session_id: String,
+        notifications: PomodoroNotificationOptions,
+    },
+    MonitoringUnavailablePaused {
+        session_id: String,
+        notifications: PomodoroNotificationOptions,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PomodoroNotificationOptions {
+    pub system_notifications: bool,
+    pub chrome_notifications: bool,
+    pub sound_enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PomodoroActionToken {
+    Distraction {
+        session_id: String,
+        sequence: u64,
+    },
+    PhaseCompleted {
+        session_id: String,
+        completed: PhaseView,
+        next: PhaseView,
+    },
+    Paused {
+        session_id: String,
+        reason: PauseReasonView,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PomodoroNotificationAction {
+    Continue,
+    Pause,
+    Stop,
 }
 
 pub fn category_is_allowed(category: &[String], selected: &[CategoryPath]) -> bool {

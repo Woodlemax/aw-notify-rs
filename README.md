@@ -177,6 +177,12 @@ AFK state, and effective `classes` setting from ActivityWatch. Parent category
 selections include every descendant, while uncategorized or unselected activity
 drives the configurable repeated-distraction timeout.
 
+On Windows, Pomodoro lifecycle events are delivered as native Toast
+notifications even when Chrome and the web UI are closed. Distraction warnings
+include Continue, Pause, and Stop buttons. See
+[`docs/pomodoro-windows-notifications.md`](docs/pomodoro-windows-notifications.md)
+for the complete event/action matrix and Windows build notes.
+
 ## Category Aggregation
 
 aw-notify-rs supports three different category aggregation modes for analyzing your time:

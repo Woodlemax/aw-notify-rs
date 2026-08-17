@@ -32,6 +32,7 @@ use std::time;
 mod dirs;
 mod logging;
 mod pomodoro_activity;
+mod pomodoro_notifications;
 
 static AW_CLIENT: OnceLock<aw_client_rust::blocking::AwClient> = OnceLock::new();
 static HOSTNAME: OnceLock<String> = OnceLock::new();
@@ -43,6 +44,7 @@ static NOTIFICATION_TX: OnceLock<crossbeam_channel::Sender<QueuedNotification>> 
 // drift on where notifications are sent.
 use aw_notify_client::{NotificationRequest, DEFAULT_HOST as HTTP_HOST, DEFAULT_PORT};
 use pomodoro_activity::ActivityWatchActivitySource;
+use pomodoro_notifications::{NotificationLocale, PomodoroActionRequest};
 /// Maximum accepted size of an HTTP notification request body, in bytes.
 const MAX_HTTP_BODY_SIZE: u64 = 64 * 1024;
 
@@ -1290,6 +1292,7 @@ fn start_http_server(
     mut pomodoro_api: PomodoroApi,
     mut activity_source: ActivityWatchActivitySource,
 ) {
+    let (pomodoro_action_tx, pomodoro_action_rx) = unbounded::<PomodoroActionRequest>();
     thread::spawn(move || {
         let addr = format!("{}:{}", HTTP_HOST, port);
         log::info!("Starting HTTP server thread on {}", addr);
@@ -1310,6 +1313,23 @@ fn start_http_server(
         loop {
             if let Err(error) = pomodoro_api.poll() {
                 log::error!("Pomodoro timer polling failed: {}", error);
+            }
+
+            while let Ok(request) = pomodoro_action_rx.try_recv() {
+                match pomodoro_api.apply_notification_action(&request.token, request.action) {
+                    Ok(true) => {
+                        log::info!("Applied Pomodoro notification action: {:?}", request.action)
+                    }
+                    Ok(false) => log::debug!(
+                        "Ignored stale or duplicate Pomodoro notification action: {:?}",
+                        request.action
+                    ),
+                    Err(error) => log::warn!(
+                        "Pomodoro notification action {:?} was rejected: {}",
+                        request.action,
+                        error
+                    ),
+                }
             }
 
             let now = time::Instant::now();
@@ -1346,7 +1366,15 @@ fn start_http_server(
             }
 
             for event in pomodoro_api.take_events() {
-                log_pomodoro_event(event);
+                log_pomodoro_event(&event);
+                if let Err(error) = pomodoro_notifications::show_notification(
+                    &event,
+                    pomodoro_notification_locale(),
+                    &pomodoro_action_tx,
+                    OUTPUT_ONLY.load(Ordering::Relaxed),
+                ) {
+                    log::error!("Failed to show Pomodoro notification: {error}");
+                }
             }
 
             // Check for shutdown signal
@@ -1535,14 +1563,16 @@ fn start_http_server(
     });
 }
 
-fn log_pomodoro_event(event: PomodoroEvent) {
+fn log_pomodoro_event(event: &PomodoroEvent) {
     match event {
         PomodoroEvent::DistractionWarning {
             sequence,
             current_category,
             remaining_milliseconds,
+            ..
         } => {
             let category = current_category
+                .as_ref()
                 .map(|path| path.join(" > "))
                 .unwrap_or_else(|| "Uncategorized".to_string());
             log::warn!(
@@ -1550,15 +1580,37 @@ fn log_pomodoro_event(event: PomodoroEvent) {
                 remaining_milliseconds / 1_000
             );
         }
-        PomodoroEvent::AfkPaused => {
+        PomodoroEvent::PhaseCompleted {
+            completed, next, ..
+        } => {
+            log::info!(
+                "Pomodoro phase completed: {:?}; waiting to start {:?}",
+                completed.kind,
+                next.kind
+            );
+        }
+        PomodoroEvent::SessionCompleted {
+            focus_intervals, ..
+        } => {
+            log::info!("Pomodoro session completed after {focus_intervals} work phases");
+        }
+        PomodoroEvent::AfkPaused { .. } => {
             log::info!("Pomodoro paused automatically because the user is AFK");
         }
-        PomodoroEvent::MonitoringUnavailablePaused => {
+        PomodoroEvent::MonitoringUnavailablePaused { .. } => {
             log::warn!(
                 "Pomodoro paused because ActivityWatch monitoring is unavailable; manual resume is required after recovery"
             );
         }
     }
+}
+
+fn pomodoro_notification_locale() -> NotificationLocale {
+    let locale = AW_CLIENT
+        .get()
+        .and_then(|client| client.get_setting("locale").ok())
+        .and_then(|value| value.as_str().map(str::to_owned));
+    NotificationLocale::from_code(locale.as_deref())
 }
 
 fn get_active_status(hostname: &str) -> Result<Option<bool>> {

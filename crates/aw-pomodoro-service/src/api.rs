@@ -6,7 +6,7 @@ use serde_json::{json, Value};
 
 use crate::model::{PomodoroSettings, StartRequest};
 use crate::service::{PomodoroService, ServiceError};
-use crate::{ActivityObservation, PomodoroEvent};
+use crate::{ActivityObservation, PomodoroActionToken, PomodoroEvent, PomodoroNotificationAction};
 
 const MAX_API_BODY_SIZE: usize = 64 * 1024;
 
@@ -184,6 +184,25 @@ impl PomodoroApi {
 
     pub fn take_events(&mut self) -> Vec<PomodoroEvent> {
         self.service.take_events()
+    }
+
+    pub fn apply_notification_action(
+        &mut self,
+        token: &PomodoroActionToken,
+        action: PomodoroNotificationAction,
+    ) -> Result<bool, ServiceError> {
+        self.apply_notification_action_at(token, action, Instant::now(), Utc::now())
+    }
+
+    pub fn apply_notification_action_at(
+        &mut self,
+        token: &PomodoroActionToken,
+        action: PomodoroNotificationAction,
+        now: Instant,
+        wall_now: DateTime<Utc>,
+    ) -> Result<bool, ServiceError> {
+        self.service
+            .apply_notification_action(token, action, now, wall_now)
     }
 
     fn check_origin(&self, origin: Option<&str>) -> Result<Option<String>, ApiResponse> {

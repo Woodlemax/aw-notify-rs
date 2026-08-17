@@ -10,7 +10,10 @@ use aw_pomodoro_core::{
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
-use crate::focus::{category_is_allowed, ActivityObservation, PomodoroEvent};
+use crate::focus::{
+    category_is_allowed, ActivityObservation, PomodoroActionToken, PomodoroEvent,
+    PomodoroNotificationAction, PomodoroNotificationOptions,
+};
 use crate::history::HistoryStore;
 use crate::model::{
     validate_categories, DistractionView, HistoryPage, InterruptionReason, PauseReasonView,
@@ -284,7 +287,11 @@ impl PomodoroService {
                     .timer
                     .pause(now, PauseReason::Afk)
                     .map_err(ServiceError::Timer)?;
-                self.pending_events.push(PomodoroEvent::AfkPaused);
+                let event = PomodoroEvent::AfkPaused {
+                    session_id: session.session_id.clone(),
+                    notifications: notification_options(&session.settings),
+                };
+                self.pending_events.push(event);
                 self.save_checkpoint(wall_now)?;
             }
             return Ok(());
@@ -341,9 +348,11 @@ impl PomodoroService {
                 .map_err(ServiceError::Timer)?
                 .map_or(0, duration_milliseconds);
             Some(PomodoroEvent::DistractionWarning {
+                session_id: session.session_id.clone(),
                 sequence: session.focus.warning_sequence,
                 current_category: category,
                 remaining_milliseconds,
+                notifications: notification_options(&session.settings),
             })
         } else {
             None
@@ -373,8 +382,11 @@ impl PomodoroService {
                 .timer
                 .pause(now, PauseReason::MonitoringUnavailable)
                 .map_err(ServiceError::Timer)?;
-            self.pending_events
-                .push(PomodoroEvent::MonitoringUnavailablePaused);
+            let event = PomodoroEvent::MonitoringUnavailablePaused {
+                session_id: session.session_id.clone(),
+                notifications: notification_options(&session.settings),
+            };
+            self.pending_events.push(event);
             self.save_checkpoint(wall_now)?;
         }
         Ok(())
@@ -412,6 +424,43 @@ impl PomodoroService {
         std::mem::take(&mut self.pending_events)
     }
 
+    /// Apply a button click from a desktop notification only if the notification
+    /// still describes the current session state. The HTTP thread serializes these
+    /// commands with normal API requests, so duplicate clicks become harmless stale
+    /// actions after the first successful transition.
+    pub fn apply_notification_action(
+        &mut self,
+        token: &PomodoroActionToken,
+        action: PomodoroNotificationAction,
+        now: Instant,
+        wall_now: DateTime<Utc>,
+    ) -> Result<bool, ServiceError> {
+        self.tick(now, wall_now)?;
+        if !self.notification_token_is_current(token, now)? {
+            return Ok(false);
+        }
+
+        match (token, action) {
+            (PomodoroActionToken::Distraction { .. }, PomodoroNotificationAction::Continue) => {
+                self.acknowledge_distraction(now, wall_now)?;
+            }
+            (PomodoroActionToken::Distraction { .. }, PomodoroNotificationAction::Pause) => {
+                self.pause(now, wall_now)?;
+            }
+            (PomodoroActionToken::PhaseCompleted { .. }, PomodoroNotificationAction::Continue) => {
+                self.confirm_next(now, wall_now)?;
+            }
+            (PomodoroActionToken::Paused { .. }, PomodoroNotificationAction::Continue) => {
+                self.resume(now, wall_now)?;
+            }
+            (_, PomodoroNotificationAction::Stop) => {
+                self.stop(now, wall_now)?;
+            }
+            _ => return Ok(false),
+        }
+        Ok(true)
+    }
+
     pub fn tick(&mut self, now: Instant, wall_now: DateTime<Utc>) -> Result<(), ServiceError> {
         if !self.has_active_session() {
             return Ok(());
@@ -427,6 +476,30 @@ impl PomodoroService {
         if event.is_some() {
             if let Some(session) = self.current.as_mut() {
                 session.focus.reset();
+            }
+        }
+
+        if let Some(event) = event {
+            let notification_event = self.current.as_ref().and_then(|session| match event {
+                aw_pomodoro_core::TimerEvent::PhaseCompleted { completed, next } => {
+                    Some(PomodoroEvent::PhaseCompleted {
+                        session_id: session.session_id.clone(),
+                        completed: phase_view(completed),
+                        next: phase_view(next),
+                        notifications: notification_options(&session.settings),
+                    })
+                }
+                aw_pomodoro_core::TimerEvent::SessionCompleted { focus_intervals } => {
+                    Some(PomodoroEvent::SessionCompleted {
+                        session_id: session.session_id.clone(),
+                        focus_intervals,
+                        notifications: notification_options(&session.settings),
+                    })
+                }
+                _ => None,
+            });
+            if let Some(notification_event) = notification_event {
+                self.pending_events.push(notification_event);
             }
         }
 
@@ -552,6 +625,47 @@ impl PomodoroService {
             page,
             page_size,
             total,
+        })
+    }
+
+    fn notification_token_is_current(
+        &self,
+        token: &PomodoroActionToken,
+        now: Instant,
+    ) -> Result<bool, ServiceError> {
+        let state = self.state(now)?;
+        let Some(current_session_id) = state.session_id.as_deref() else {
+            return Ok(false);
+        };
+
+        Ok(match token {
+            PomodoroActionToken::Distraction {
+                session_id,
+                sequence,
+            } => {
+                current_session_id == session_id
+                    && state.state == PomodoroState::RunningWork
+                    && state.distraction.warning_pending
+                    && state.distraction.warning_sequence == *sequence
+            }
+            PomodoroActionToken::PhaseCompleted {
+                session_id,
+                completed,
+                next,
+            } => {
+                current_session_id == session_id
+                    && state.state == PomodoroState::WaitingConfirmation
+                    && state.phase.as_ref() == Some(completed)
+                    && state.next_phase.as_ref() == Some(next)
+            }
+            PomodoroActionToken::Paused { session_id, reason } => {
+                current_session_id == session_id
+                    && matches!(
+                        state.state,
+                        PomodoroState::PausedManual | PomodoroState::PausedAfk
+                    )
+                    && state.pause_reason == Some(*reason)
+            }
         })
     }
 
@@ -816,6 +930,14 @@ fn deduplicate_categories(
         .into_iter()
         .filter(|path| seen.insert(path.clone()))
         .collect()
+}
+
+fn notification_options(settings: &crate::model::SessionSettings) -> PomodoroNotificationOptions {
+    PomodoroNotificationOptions {
+        system_notifications: settings.system_notifications,
+        chrome_notifications: settings.chrome_notifications,
+        sound_enabled: settings.sound_enabled,
+    }
 }
 
 fn duration_milliseconds(duration: Duration) -> u64 {

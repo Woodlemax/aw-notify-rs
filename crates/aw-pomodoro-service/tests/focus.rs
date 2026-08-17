@@ -210,6 +210,10 @@ fn categories_are_ignored_during_breaks() {
     service
         .tick(now + Duration::from_secs(1), at(wall, 1))
         .unwrap();
+    assert!(matches!(
+        service.take_events().as_slice(),
+        [PomodoroEvent::PhaseCompleted { .. }]
+    ));
     service
         .confirm_next(now + Duration::from_secs(1), at(wall, 1))
         .unwrap();
@@ -280,7 +284,7 @@ fn afk_pauses_and_requires_manual_resume_after_return() {
         .unwrap();
     assert!(matches!(
         service.take_events().as_slice(),
-        [PomodoroEvent::AfkPaused]
+        [PomodoroEvent::AfkPaused { .. }]
     ));
     let paused = service.state(now + Duration::from_secs(1)).unwrap();
     assert_eq!(paused.state, PomodoroState::PausedAfk);
@@ -330,7 +334,7 @@ fn monitoring_failure_pauses_until_recovery_and_manual_resume() {
         .unwrap();
     assert!(matches!(
         service.take_events().as_slice(),
-        [PomodoroEvent::MonitoringUnavailablePaused]
+        [PomodoroEvent::MonitoringUnavailablePaused { .. }]
     ));
     let paused = service.state(now + Duration::from_secs(1)).unwrap();
     assert_eq!(paused.state, PomodoroState::PausedManual);
