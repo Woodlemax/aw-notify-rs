@@ -11,7 +11,11 @@ keywords = ["activitywatch", "time-tracking", "notifications"]
 categories = ["gui"]
 
 [workspace]
-members = ["crates/aw-notify-client", "crates/aw-pomodoro-core"]
+members = [
+    "crates/aw-notify-client",
+    "crates/aw-pomodoro-core",
+    "crates/aw-pomodoro-service",
+]
 
 [[bin]]
 name = "aw-notify"
@@ -20,6 +24,7 @@ path = "src/main.rs"
 [dependencies]
 # Shared notification client + wire types (also re-used server-side)
 aw-notify-client = { path = "crates/aw-notify-client" }
+aw-pomodoro-service = { path = "crates/aw-pomodoro-service" }
 
 # ActivityWatch client
 aw-client-rust = {git = "https://github.com/ActivityWatch/aw-server-rust", branch="master"}

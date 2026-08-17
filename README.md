@@ -161,6 +161,17 @@ A runnable example lives in [`examples/notify_client.rs`](examples/notify_client
 cargo run --example notify_client "Build finished" "All tests passed ✅"
 ```
 
+## Pomodoro API
+
+The background service also exposes a loopback-only Pomodoro API at
+`http://127.0.0.1:5667/pomodoro`. It manages sessions independently of the
+ActivityWatch web UI or Chrome and writes terminal sessions to the
+`aw-pomodoro_<hostname>` bucket.
+
+See [`docs/pomodoro-api.md`](docs/pomodoro-api.md) for the request and response
+schema. A ready-to-run manual request collection is available in
+[`docs/pomodoro-api.http`](docs/pomodoro-api.http).
+
 ## Category Aggregation
 
 aw-notify-rs supports three different category aggregation modes for analyzing your time:
@@ -288,6 +299,7 @@ The configuration file supports the following options:
 - `new_day_greetings`: Enable/disable new day greeting notifications (default: true)
 - `server_monitoring`: Enable/disable ActivityWatch server monitoring alerts (default: true)
 - `http_port`: Port for the local HTTP API that other modules use to send notifications (default: 5667). See [Sending notifications from other modules](#sending-notifications-from-other-modules).
+- `pomodoro_allowed_origins`: Exact browser origins allowed to call the Pomodoro API. Native clients without an `Origin` header remain supported for local administration.
 
 #### Category Alerts
 Configure custom category alerts using the `[[alerts]]` sections:

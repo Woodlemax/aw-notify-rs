@@ -1,0 +1,62 @@
+@baseUrl = http://127.0.0.1:5667/pomodoro
+
+### Read current state
+GET {{baseUrl}}/state
+
+### Read saved settings
+GET {{baseUrl}}/settings
+
+### Save short settings for manual testing
+PUT {{baseUrl}}/settings
+Content-Type: application/json
+
+{
+  "focus_duration_seconds": 10,
+  "short_break_duration_seconds": 5,
+  "long_break_duration_seconds": 8,
+  "work_intervals": 3,
+  "distraction_timeout_seconds": 3,
+  "system_notifications": true,
+  "chrome_notifications": true,
+  "sound_enabled": true,
+  "last_selected_categories": [["Work"]]
+}
+
+### Start using saved settings
+POST {{baseUrl}}/start
+Content-Type: application/json
+
+{
+  "selected_categories": [["Work"]]
+}
+
+### Pause
+POST {{baseUrl}}/pause
+Content-Type: application/json
+
+{}
+
+### Resume
+POST {{baseUrl}}/resume
+Content-Type: application/json
+
+{}
+
+### Confirm the pending next phase
+POST {{baseUrl}}/confirm-next
+Content-Type: application/json
+
+{}
+
+### Stop and save as interrupted
+POST {{baseUrl}}/stop
+Content-Type: application/json
+
+{}
+
+### Read first history page
+GET {{baseUrl}}/history?page=1&page_size=20
+
+### Expected rejection: a browser origin outside the allowlist
+GET {{baseUrl}}/state
+Origin: https://example.com

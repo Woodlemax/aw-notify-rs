@@ -6,7 +6,11 @@
 use anyhow::{anyhow, Result};
 use aw_client_rust::classes::{default_classes, CategoryId, CategorySpec, ClassSetting};
 use aw_client_rust::queries::{DesktopQueryParams, QueryParams, QueryParamsBase};
-use aw_models::TimeInterval;
+use aw_models::{Event, TimeInterval};
+use aw_pomodoro_service::{
+    ApiRequest as PomodoroApiRequest, HistoryError as PomodoroHistoryError,
+    HistoryStore as PomodoroHistoryStore, PomodoroApi, PomodoroService, SessionHistory,
+};
 use chrono::{DateTime, Datelike, Duration, Local, TimeZone, Timelike, Utc};
 use clap::Parser;
 use crossbeam_channel::{bounded, unbounded, Receiver};
@@ -88,7 +92,7 @@ impl Default for AlertConfig {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct NotificationConfig {
     pub alerts: Vec<AlertConfig>,
@@ -97,6 +101,7 @@ pub struct NotificationConfig {
     pub server_monitoring: bool,
     pub productivity_score: bool,
     pub http_port: u16,
+    pub pomodoro_allowed_origins: Vec<String>,
 }
 
 impl Default for NotificationConfig {
@@ -132,7 +137,13 @@ impl Default for NotificationConfig {
             new_day_greetings: true,
             server_monitoring: true,
             productivity_score: true,
-            http_port: 0,
+            http_port: DEFAULT_PORT,
+            pomodoro_allowed_origins: vec![
+                "http://127.0.0.1:5600".to_string(),
+                "http://localhost:5600".to_string(),
+                "http://127.0.0.1:5666".to_string(),
+                "http://localhost:5666".to_string(),
+            ],
         }
     }
 }
@@ -251,7 +262,11 @@ fn run_app(cli: Cli) -> Result<()> {
     match cli.command.unwrap_or(Commands::Start) {
         Commands::Start => {
             // Load configuration
-            let config = load_config(cli.config.clone())?;
+            let config_path = cli
+                .config
+                .clone()
+                .unwrap_or_else(dirs::get_default_config_path);
+            let config = load_config(Some(config_path.clone()))?;
 
             // Initialize client (matching Python's start function)
             let port = cli.port.unwrap_or(if cli.testing { 5666 } else { 5600 });
@@ -272,7 +287,7 @@ fn run_app(cli: Cli) -> Result<()> {
             AW_CLIENT.set(client).ok();
             HOSTNAME.set(hostname.clone()).ok();
 
-            start_service(hostname, config)
+            start_service(hostname, config, config_path)
         }
         Commands::Checkin { testing } => {
             // Initialize client for checkin (matching Python's checkin function)
@@ -319,7 +334,11 @@ fn run_app(cli: Cli) -> Result<()> {
     }
 }
 
-fn start_service(hostname: String, config: NotificationConfig) -> Result<()> {
+fn start_service(
+    hostname: String,
+    config: NotificationConfig,
+    config_path: std::path::PathBuf,
+) -> Result<()> {
     log::info!("Starting notification service...");
 
     // Initialize notification queue and worker thread (unbounded queue)
@@ -395,7 +414,16 @@ fn start_service(hostname: String, config: NotificationConfig) -> Result<()> {
     }
 
     if config.http_port != 0 {
-        start_http_server(shutdown_rx_http, config.http_port);
+        let state_path = config_path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .join("pomodoro-state.json");
+        let history_store = Box::new(ActivityWatchPomodoroHistory::new(&hostname));
+        let pomodoro_service = PomodoroService::open(state_path, history_store)
+            .map_err(|error| anyhow!("Failed to initialize Pomodoro service: {error}"))?;
+        let pomodoro_api =
+            PomodoroApi::new(pomodoro_service, config.pomodoro_allowed_origins.clone());
+        start_http_server(shutdown_rx_http, config.http_port, pomodoro_api);
     } else {
         log::info!(
             "HTTP notification server disabled (set http_port = {} in config to enable)",
@@ -1166,7 +1194,88 @@ fn start_server_monitor(shutdown_rx: Receiver<()>) {
     });
 }
 
-fn start_http_server(shutdown_rx: Receiver<()>, port: u16) {
+struct ActivityWatchPomodoroHistory {
+    bucket_id: String,
+}
+
+impl ActivityWatchPomodoroHistory {
+    fn new(hostname: &str) -> Self {
+        Self {
+            bucket_id: format!("aw-pomodoro_{hostname}"),
+        }
+    }
+
+    fn client(&self) -> Result<&'static aw_client_rust::blocking::AwClient, PomodoroHistoryError> {
+        AW_CLIENT
+            .get()
+            .ok_or_else(|| PomodoroHistoryError("ActivityWatch client is not initialized".into()))
+    }
+
+    fn ensure_bucket(&self) -> Result<(), PomodoroHistoryError> {
+        self.client()?
+            .create_bucket_simple(&self.bucket_id, "pomodoro.session")
+            .map_err(|error| {
+                PomodoroHistoryError(format!(
+                    "failed to create bucket {}: {error}",
+                    self.bucket_id
+                ))
+            })
+    }
+}
+
+impl PomodoroHistoryStore for ActivityWatchPomodoroHistory {
+    fn append(&mut self, session: &SessionHistory) -> Result<(), PomodoroHistoryError> {
+        self.ensure_bucket()?;
+        let existing = self.load_all()?;
+        if existing
+            .iter()
+            .any(|item| item.session_id == session.session_id)
+        {
+            return Ok(());
+        }
+
+        let data = serde_json::to_value(session)
+            .map_err(|error| {
+                PomodoroHistoryError(format!("failed to serialize Pomodoro history: {error}"))
+            })?
+            .as_object()
+            .cloned()
+            .ok_or_else(|| PomodoroHistoryError("Pomodoro history is not a JSON object".into()))?;
+        let duration = (session.ended_at - session.started_at).max(Duration::zero());
+        let event = Event::new(session.started_at, duration, data);
+        self.client()?
+            .insert_event(&self.bucket_id, &event)
+            .map_err(|error| {
+                PomodoroHistoryError(format!(
+                    "failed to write bucket {}: {error}",
+                    self.bucket_id
+                ))
+            })
+    }
+
+    fn load_all(&mut self) -> Result<Vec<SessionHistory>, PomodoroHistoryError> {
+        self.ensure_bucket()?;
+        let events = self
+            .client()?
+            .get_events(&self.bucket_id, None, None, None)
+            .map_err(|error| {
+                PomodoroHistoryError(format!("failed to read bucket {}: {error}", self.bucket_id))
+            })?;
+        events
+            .into_iter()
+            .map(|event| {
+                serde_json::from_value(serde_json::Value::Object(event.data)).map_err(|error| {
+                    PomodoroHistoryError(format!(
+                        "invalid Pomodoro history event in {}: {error}",
+                        self.bucket_id
+                    ))
+                })
+            })
+            .collect()
+    }
+}
+
+fn start_http_server(shutdown_rx: Receiver<()>, port: u16, mut pomodoro_api: PomodoroApi) {
     thread::spawn(move || {
         let addr = format!("{}:{}", HTTP_HOST, port);
         log::info!("Starting HTTP server thread on {}", addr);
@@ -1180,6 +1289,10 @@ fn start_http_server(shutdown_rx: Receiver<()>, port: u16) {
 
         // We use try_recv loop to allow graceful shutdown without blocking indefinitely on server.recv()
         loop {
+            if let Err(error) = pomodoro_api.poll() {
+                log::error!("Pomodoro timer polling failed: {}", error);
+            }
+
             // Check for shutdown signal
             match shutdown_rx.try_recv() {
                 Ok(_) | Err(crossbeam_channel::TryRecvError::Disconnected) => {
@@ -1192,7 +1305,74 @@ fn start_http_server(shutdown_rx: Receiver<()>, port: u16) {
             match server.try_recv() {
                 Ok(Some(mut request)) => {
                     // Ignore any query string so e.g. "/notify?foo=bar" still matches.
-                    let path = request.url().split('?').next().unwrap_or("");
+                    let url = request.url().to_string();
+                    let path = url.split('?').next().unwrap_or("");
+                    if path == "/pomodoro" || path.starts_with("/pomodoro/") {
+                        let origin = request
+                            .headers()
+                            .iter()
+                            .find(|header| header.field.equiv("Origin"))
+                            .map(|header| header.value.as_str().to_string());
+                        let content_type = request
+                            .headers()
+                            .iter()
+                            .find(|header| header.field.equiv("Content-Type"))
+                            .map(|header| header.value.as_str().to_string());
+                        let method = request.method().as_str().to_string();
+                        let mut content = Vec::new();
+                        let reader: &mut dyn Read = request.as_reader();
+                        if let Err(error) =
+                            Read::take(reader, MAX_HTTP_BODY_SIZE + 1).read_to_end(&mut content)
+                        {
+                            log::warn!("Failed to read Pomodoro API request body: {}", error);
+                            let response = tiny_http::Response::from_string("Failed to read body")
+                                .with_status_code(400);
+                            let _ = request.respond(response);
+                            continue;
+                        }
+
+                        let api_response = pomodoro_api.handle(PomodoroApiRequest {
+                            method: &method,
+                            url: &url,
+                            origin: origin.as_deref(),
+                            content_type: content_type.as_deref(),
+                            body: &content,
+                        });
+                        let mut response = tiny_http::Response::from_data(api_response.body)
+                            .with_status_code(api_response.status_code);
+                        if let Ok(header) = tiny_http::Header::from_bytes(
+                            b"Content-Type",
+                            b"application/json; charset=utf-8",
+                        ) {
+                            response.add_header(header);
+                        }
+                        if let Some(origin) = api_response.allow_origin {
+                            if let Ok(header) = tiny_http::Header::from_bytes(
+                                b"Access-Control-Allow-Origin",
+                                origin.as_bytes(),
+                            ) {
+                                response.add_header(header);
+                            }
+                            if let Ok(header) = tiny_http::Header::from_bytes(b"Vary", b"Origin") {
+                                response.add_header(header);
+                            }
+                        }
+                        if let Ok(header) = tiny_http::Header::from_bytes(
+                            b"Access-Control-Allow-Methods",
+                            b"GET, POST, PUT, OPTIONS",
+                        ) {
+                            response.add_header(header);
+                        }
+                        if let Ok(header) = tiny_http::Header::from_bytes(
+                            b"Access-Control-Allow-Headers",
+                            b"Content-Type",
+                        ) {
+                            response.add_header(header);
+                        }
+                        let _ = request.respond(response);
+                        continue;
+                    }
+
                     if request.method().as_str() == "POST" && path == "/notify" {
                         let mut content = String::new();
                         // Cap the body size so a misbehaving local client can't OOM the daemon.

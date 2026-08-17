@@ -20,11 +20,18 @@ server_monitoring = true
 # Enable or disable productivity score notification on new day
 productivity_score = true
 
-# Port for the local HTTP API that other modules use to send notifications
-# (POST http://127.0.0.1:<http_port>/notify). See the README section
-# "Sending notifications from other modules".
-# Disabled by default (http_port = 0). Set to 5667 (or any free port) to enable.
-http_port = 0
+# Port for the loopback notification and Pomodoro APIs.
+# Set to 0 only if both local APIs should be disabled.
+http_port = 5667
+
+# Browser origins allowed to access /pomodoro. Requests without Origin remain
+# available to native clients and manual command-line checks on this computer.
+pomodoro_allowed_origins = [
+    "http://127.0.0.1:5600",
+    "http://localhost:5600",
+    "http://127.0.0.1:5666",
+    "http://localhost:5666",
+]
 
 # Category alerts configuration
 # Each alert monitors a specific category and sends notifications when thresholds are reached
