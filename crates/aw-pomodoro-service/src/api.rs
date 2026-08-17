@@ -6,6 +6,7 @@ use serde_json::{json, Value};
 
 use crate::model::{PomodoroSettings, StartRequest};
 use crate::service::{PomodoroService, ServiceError};
+use crate::{ActivityObservation, PomodoroEvent};
 
 const MAX_API_BODY_SIZE: usize = 64 * 1024;
 
@@ -123,6 +124,14 @@ impl PomodoroApi {
                 }
                 self.service.confirm_next(now, wall_now).map(JsonBody::new)
             }
+            ("POST", "/pomodoro/distraction/continue") => {
+                if let Err(response) = validate_command_request(request, allow_origin.clone()) {
+                    return response;
+                }
+                self.service
+                    .acknowledge_distraction(now, wall_now)
+                    .map(JsonBody::new)
+            }
             ("GET", "/pomodoro/history") => parse_history_query(query)
                 .and_then(|(page, page_size)| self.service.history(page, page_size))
                 .map(JsonBody::new),
@@ -139,6 +148,42 @@ impl PomodoroApi {
 
     pub fn poll(&mut self) -> Result<(), ServiceError> {
         self.service.tick(Instant::now(), Utc::now())
+    }
+
+    pub fn observe_activity(
+        &mut self,
+        observation: ActivityObservation,
+    ) -> Result<(), ServiceError> {
+        self.observe_activity_at(observation, Instant::now(), Utc::now())
+    }
+
+    pub fn observe_activity_at(
+        &mut self,
+        observation: ActivityObservation,
+        now: Instant,
+        wall_now: DateTime<Utc>,
+    ) -> Result<(), ServiceError> {
+        self.service.observe_activity(observation, now, wall_now)
+    }
+
+    pub fn monitoring_failed(&mut self) -> Result<(), ServiceError> {
+        self.monitoring_failed_at(Instant::now(), Utc::now())
+    }
+
+    pub fn monitoring_failed_at(
+        &mut self,
+        now: Instant,
+        wall_now: DateTime<Utc>,
+    ) -> Result<(), ServiceError> {
+        self.service.monitoring_failed(now, wall_now)
+    }
+
+    pub fn should_monitor(&self) -> bool {
+        self.service.should_monitor()
+    }
+
+    pub fn take_events(&mut self) -> Vec<PomodoroEvent> {
+        self.service.take_events()
     }
 
     fn check_origin(&self, origin: Option<&str>) -> Result<Option<String>, ApiResponse> {

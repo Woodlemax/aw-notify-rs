@@ -9,7 +9,8 @@ use aw_client_rust::queries::{DesktopQueryParams, QueryParams, QueryParamsBase};
 use aw_models::{Event, TimeInterval};
 use aw_pomodoro_service::{
     ApiRequest as PomodoroApiRequest, HistoryError as PomodoroHistoryError,
-    HistoryStore as PomodoroHistoryStore, PomodoroApi, PomodoroService, SessionHistory,
+    HistoryStore as PomodoroHistoryStore, PomodoroApi, PomodoroEvent, PomodoroService,
+    SessionHistory,
 };
 use chrono::{DateTime, Datelike, Duration, Local, TimeZone, Timelike, Utc};
 use clap::Parser;
@@ -30,6 +31,7 @@ use std::time;
 
 mod dirs;
 mod logging;
+mod pomodoro_activity;
 
 static AW_CLIENT: OnceLock<aw_client_rust::blocking::AwClient> = OnceLock::new();
 static HOSTNAME: OnceLock<String> = OnceLock::new();
@@ -40,6 +42,7 @@ static NOTIFICATION_TX: OnceLock<crossbeam_channel::Sender<QueuedNotification>> 
 // Host/port defaults live in aw-notify-client so the client and server can't
 // drift on where notifications are sent.
 use aw_notify_client::{NotificationRequest, DEFAULT_HOST as HTTP_HOST, DEFAULT_PORT};
+use pomodoro_activity::ActivityWatchActivitySource;
 /// Maximum accepted size of an HTTP notification request body, in bytes.
 const MAX_HTTP_BODY_SIZE: u64 = 64 * 1024;
 
@@ -423,7 +426,13 @@ fn start_service(
             .map_err(|error| anyhow!("Failed to initialize Pomodoro service: {error}"))?;
         let pomodoro_api =
             PomodoroApi::new(pomodoro_service, config.pomodoro_allowed_origins.clone());
-        start_http_server(shutdown_rx_http, config.http_port, pomodoro_api);
+        let activity_source = ActivityWatchActivitySource::new(hostname);
+        start_http_server(
+            shutdown_rx_http,
+            config.http_port,
+            pomodoro_api,
+            activity_source,
+        );
     } else {
         log::info!(
             "HTTP notification server disabled (set http_port = {} in config to enable)",
@@ -1275,7 +1284,12 @@ impl PomodoroHistoryStore for ActivityWatchPomodoroHistory {
     }
 }
 
-fn start_http_server(shutdown_rx: Receiver<()>, port: u16, mut pomodoro_api: PomodoroApi) {
+fn start_http_server(
+    shutdown_rx: Receiver<()>,
+    port: u16,
+    mut pomodoro_api: PomodoroApi,
+    mut activity_source: ActivityWatchActivitySource,
+) {
     thread::spawn(move || {
         let addr = format!("{}:{}", HTTP_HOST, port);
         log::info!("Starting HTTP server thread on {}", addr);
@@ -1287,10 +1301,52 @@ fn start_http_server(shutdown_rx: Receiver<()>, port: u16, mut pomodoro_api: Pom
             }
         };
 
+        let mut last_activity_poll = time::Instant::now()
+            .checked_sub(time::Duration::from_secs(1))
+            .unwrap_or_else(time::Instant::now);
+        let mut monitoring_error_active = false;
+
         // We use try_recv loop to allow graceful shutdown without blocking indefinitely on server.recv()
         loop {
             if let Err(error) = pomodoro_api.poll() {
                 log::error!("Pomodoro timer polling failed: {}", error);
+            }
+
+            let now = time::Instant::now();
+            if pomodoro_api.should_monitor()
+                && now.saturating_duration_since(last_activity_poll) >= time::Duration::from_secs(1)
+            {
+                last_activity_poll = now;
+                let observation = AW_CLIENT
+                    .get()
+                    .ok_or_else(|| anyhow!("ActivityWatch client is not initialized"))
+                    .and_then(|client| activity_source.observe(client, now, Utc::now()));
+                match observation {
+                    Ok(observation) => {
+                        if monitoring_error_active {
+                            log::info!("Pomodoro ActivityWatch monitoring recovered");
+                            monitoring_error_active = false;
+                        }
+                        if let Err(error) = pomodoro_api.observe_activity(observation) {
+                            log::error!("Failed to apply Pomodoro activity observation: {error}");
+                        }
+                    }
+                    Err(error) => {
+                        if !monitoring_error_active {
+                            log::warn!("Pomodoro activity monitoring unavailable: {error}");
+                            monitoring_error_active = true;
+                        }
+                        if let Err(service_error) = pomodoro_api.monitoring_failed() {
+                            log::error!(
+                                "Failed to pause Pomodoro after monitoring error: {service_error}"
+                            );
+                        }
+                    }
+                }
+            }
+
+            for event in pomodoro_api.take_events() {
+                log_pomodoro_event(event);
             }
 
             // Check for shutdown signal
@@ -1477,6 +1533,32 @@ fn start_http_server(shutdown_rx: Receiver<()>, port: u16, mut pomodoro_api: Pom
         }
         log::info!("HTTP server thread stopped");
     });
+}
+
+fn log_pomodoro_event(event: PomodoroEvent) {
+    match event {
+        PomodoroEvent::DistractionWarning {
+            sequence,
+            current_category,
+            remaining_milliseconds,
+        } => {
+            let category = current_category
+                .map(|path| path.join(" > "))
+                .unwrap_or_else(|| "Uncategorized".to_string());
+            log::warn!(
+                "Pomodoro distraction warning #{sequence}: category={category}, remaining={}s",
+                remaining_milliseconds / 1_000
+            );
+        }
+        PomodoroEvent::AfkPaused => {
+            log::info!("Pomodoro paused automatically because the user is AFK");
+        }
+        PomodoroEvent::MonitoringUnavailablePaused => {
+            log::warn!(
+                "Pomodoro paused because ActivityWatch monitoring is unavailable; manual resume is required after recovery"
+            );
+        }
+    }
 }
 
 fn get_active_status(hostname: &str) -> Result<Option<bool>> {

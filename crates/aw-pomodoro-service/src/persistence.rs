@@ -41,11 +41,13 @@ pub(crate) struct SessionCheckpoint {
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub(crate) struct PersistedMetrics {
     pub actual_focus_milliseconds: u64,
     pub actual_break_milliseconds: u64,
     pub manual_pause_milliseconds: u64,
     pub afk_pause_milliseconds: u64,
+    pub monitoring_pause_milliseconds: u64,
     pub distraction_count: u32,
     pub distraction_milliseconds: u64,
     pub allowed_focus_milliseconds: u64,

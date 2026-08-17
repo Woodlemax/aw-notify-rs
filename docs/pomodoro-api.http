@@ -36,6 +36,12 @@ Content-Type: application/json
 
 {}
 
+### Continue after a distraction warning without pausing the timer
+POST {{baseUrl}}/distraction/continue
+Content-Type: application/json
+
+{}
+
 ### Resume
 POST {{baseUrl}}/resume
 Content-Type: application/json

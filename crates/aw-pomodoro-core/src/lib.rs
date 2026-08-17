@@ -92,6 +92,7 @@ pub enum Phase {
 pub enum PauseReason {
     Manual,
     Afk,
+    MonitoringUnavailable,
 }
 
 /// Why a session ended before all focus intervals were completed.

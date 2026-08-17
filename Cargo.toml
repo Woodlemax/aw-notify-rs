@@ -42,6 +42,7 @@ anyhow = "1.0"
 # Logging
 log = "0.4"
 fern = "0.6"
+fancy-regex = "0.12.0"
 
 # Desktop notifications
 notify-rust = "4.10"

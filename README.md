@@ -172,6 +172,11 @@ See [`docs/pomodoro-api.md`](docs/pomodoro-api.md) for the request and response
 schema. A ready-to-run manual request collection is available in
 [`docs/pomodoro-api.http`](docs/pomodoro-api.http).
 
+During work phases the service reads the active window, current browser tab,
+AFK state, and effective `classes` setting from ActivityWatch. Parent category
+selections include every descendant, while uncategorized or unselected activity
+drives the configurable repeated-distraction timeout.
+
 ## Category Aggregation
 
 aw-notify-rs supports three different category aggregation modes for analyzing your time:

@@ -38,6 +38,7 @@ Successful responses use JSON. Errors use this shape:
 | `POST` | `/resume` | Resume a paused phase. |
 | `POST` | `/stop` | Interrupt the session and write history. |
 | `POST` | `/confirm-next` | Start the phase waiting for manual confirmation. |
+| `POST` | `/distraction/continue` | Acknowledge the current warning and start a fresh distraction timeout. |
 | `GET` | `/settings` | Read saved defaults and the last category selection. |
 | `PUT` | `/settings` | Validate and save defaults. Rejected during an active session. |
 | `GET` | `/history?page=1&page_size=20` | Read newest-first paginated history. |
@@ -112,8 +113,12 @@ session is rejected with HTTP `409`.
   "selected_categories": [["Work"]],
   "distraction": {
     "active": false,
-    "elapsed_milliseconds": 0
-  }
+    "elapsed_milliseconds": 0,
+    "warning_pending": false,
+    "warning_sequence": 0
+  },
+  "afk": false,
+  "monitoring_available": true
 }
 ```
 
@@ -131,8 +136,23 @@ Possible `state` values:
 During `waiting_confirmation`, `phase` is the completed phase and `next_phase`
 is the phase that will start only after `POST /confirm-next`.
 
-The current category and distraction fields are neutral until Categorization
-integration is added.
+`current_category` is the deepest matching Categorization path. It is omitted
+for `Uncategorized`, breaks, and pauses. Selecting a parent category includes
+all descendants by exact path prefix; similarly named sibling categories are
+not included.
+
+Focus monitoring runs only during work phases. Switching between selected
+categories stays focused. An unselected or uncategorized activity starts the
+configured timeout; returning before it expires cancels the warning. Continuous
+distraction emits a new warning after each fresh timeout. The warning's
+Continue action uses `/distraction/continue`; Pause and Stop use the existing
+endpoints.
+
+`afk` is sourced from the ActivityWatch `afkstatus` bucket. A running work or
+break phase is automatically paused with `pause_reason: "afk"`, and returning
+does not resume it. If ActivityWatch monitoring becomes unavailable, the phase
+is paused with `pause_reason: "monitoring_unavailable"`. Both cases require a
+manual `/resume` after the condition has cleared.
 
 ## History
 
@@ -150,8 +170,9 @@ Each history item contains:
 - `completed` or `interrupted` status and optional interruption reason;
 - settings and selected category snapshot;
 - planned and completed focus interval counts;
-- actual focus, break, manual pause, and AFK pause milliseconds;
+- actual focus, break, manual pause, AFK pause, and monitoring pause milliseconds;
 - distraction count/duration, allowed focus time, and focus percentage.
 
-Distraction-related metrics and `focus_percentage` remain unset until the
-Categorization stage supplies those measurements.
+`focus_percentage` is calculated from classified focus time as
+`allowed / (allowed + distracted) * 100`. Initial unclassified sampling time is
+excluded from this ratio.

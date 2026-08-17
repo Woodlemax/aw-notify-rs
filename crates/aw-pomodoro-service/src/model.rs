@@ -202,6 +202,8 @@ pub struct PhaseView {
 pub struct DistractionView {
     pub active: bool,
     pub elapsed_milliseconds: u64,
+    pub warning_pending: bool,
+    pub warning_sequence: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -221,6 +223,10 @@ pub struct StateResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub current_category: Option<CategoryPath>,
     pub distraction: DistractionView,
+    pub afk: bool,
+    pub monitoring_available: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pause_reason: Option<PauseReasonView>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub interruption_reason: Option<InterruptionReason>,
 }
@@ -238,9 +244,20 @@ impl StateResponse {
             selected_categories: Vec::new(),
             current_category: None,
             distraction: DistractionView::default(),
+            afk: false,
+            monitoring_available: true,
+            pause_reason: None,
             interruption_reason: None,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PauseReasonView {
+    Manual,
+    Afk,
+    MonitoringUnavailable,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -274,6 +291,8 @@ pub struct SessionHistory {
     pub actual_break_milliseconds: u64,
     pub manual_pause_milliseconds: u64,
     pub afk_pause_milliseconds: u64,
+    #[serde(default)]
+    pub monitoring_pause_milliseconds: u64,
     pub distraction_count: u32,
     pub distraction_milliseconds: u64,
     pub allowed_focus_milliseconds: u64,
@@ -301,6 +320,7 @@ pub enum ValidationError {
     EmptyCategoryPath,
     CategoryTooDeep,
     InvalidCategorySegment,
+    UncategorizedNotSelectable,
 }
 
 impl fmt::Display for ValidationError {
@@ -318,6 +338,9 @@ impl fmt::Display for ValidationError {
                     f,
                     "category segments must be non-empty and at most 256 bytes"
                 )
+            }
+            Self::UncategorizedNotSelectable => {
+                write!(f, "Uncategorized cannot be selected as a focus category")
             }
         }
     }
@@ -347,6 +370,9 @@ pub fn validate_categories(
             .any(|part| part.trim().is_empty() || part.len() > MAX_CATEGORY_SEGMENT_BYTES)
         {
             return Err(ValidationError::InvalidCategorySegment);
+        }
+        if path.len() == 1 && path[0] == "Uncategorized" {
+            return Err(ValidationError::UncategorizedNotSelectable);
         }
     }
     Ok(())

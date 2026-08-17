@@ -10,10 +10,12 @@ use aw_pomodoro_core::{
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
+use crate::focus::{category_is_allowed, ActivityObservation, PomodoroEvent};
 use crate::history::HistoryStore;
 use crate::model::{
-    validate_categories, HistoryPage, InterruptionReason, PhaseKind, PhaseView, PomodoroSettings,
-    PomodoroState, SessionHistory, SessionStatus, StartRequest, StateResponse,
+    validate_categories, DistractionView, HistoryPage, InterruptionReason, PauseReasonView,
+    PhaseKind, PhaseView, PomodoroSettings, PomodoroState, SessionHistory, SessionStatus,
+    StartRequest, StateResponse,
 };
 use crate::persistence::{FileStateStore, PersistedMetrics, PersistedState, SessionCheckpoint};
 
@@ -24,6 +26,7 @@ pub struct PomodoroService {
     persisted: PersistedState,
     history_store: Box<dyn HistoryStore>,
     current: Option<RuntimeSession>,
+    pending_events: Vec<PomodoroEvent>,
 }
 
 struct RuntimeSession {
@@ -36,6 +39,45 @@ struct RuntimeSession {
     metric_anchor: Instant,
     checkpoint_anchor: Instant,
     finalized: bool,
+    focus: FocusRuntime,
+    afk: bool,
+    monitoring_available: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FocusClassification {
+    Unknown,
+    Allowed,
+    Distracted,
+}
+
+struct FocusRuntime {
+    classification: FocusClassification,
+    current_category: Option<crate::model::CategoryPath>,
+    distracted_since: Option<Instant>,
+    warning_pending: bool,
+    warning_sequence: u64,
+}
+
+impl Default for FocusRuntime {
+    fn default() -> Self {
+        Self {
+            classification: FocusClassification::Unknown,
+            current_category: None,
+            distracted_since: None,
+            warning_pending: false,
+            warning_sequence: 0,
+        }
+    }
+}
+
+impl FocusRuntime {
+    fn reset(&mut self) {
+        self.classification = FocusClassification::Unknown;
+        self.current_category = None;
+        self.distracted_since = None;
+        self.warning_pending = false;
+    }
 }
 
 impl PomodoroService {
@@ -58,6 +100,7 @@ impl PomodoroService {
             persisted,
             history_store,
             current: None,
+            pending_events: Vec::new(),
         };
         service.flush_pending_history();
         Ok(service)
@@ -122,6 +165,9 @@ impl PomodoroService {
             metric_anchor: now,
             checkpoint_anchor: now,
             finalized: false,
+            focus: FocusRuntime::default(),
+            afk: false,
+            monitoring_available: true,
         };
 
         let mut next = self.persisted.clone();
@@ -146,6 +192,7 @@ impl PomodoroService {
             .timer
             .pause(now, PauseReason::Manual)
             .map_err(ServiceError::Timer)?;
+        session.focus.reset();
         self.save_checkpoint(wall_now)?;
         self.state(now)
     }
@@ -157,7 +204,18 @@ impl PomodoroService {
     ) -> Result<StateResponse, ServiceError> {
         self.accumulate(now);
         let session = self.active_session_mut()?;
+        if session.afk {
+            return Err(ServiceError::Conflict(
+                "the session cannot resume while the user is AFK".to_string(),
+            ));
+        }
+        if !session.monitoring_available {
+            return Err(ServiceError::Conflict(
+                "the session cannot resume until ActivityWatch monitoring recovers".to_string(),
+            ));
+        }
         session.timer.resume(now).map_err(ServiceError::Timer)?;
+        session.focus.reset();
         self.save_checkpoint(wall_now)?;
         self.state(now)
     }
@@ -169,10 +227,21 @@ impl PomodoroService {
     ) -> Result<StateResponse, ServiceError> {
         self.accumulate(now);
         let session = self.active_session_mut()?;
+        if session.afk {
+            return Err(ServiceError::Conflict(
+                "the next phase cannot start while the user is AFK".to_string(),
+            ));
+        }
+        if !session.monitoring_available {
+            return Err(ServiceError::Conflict(
+                "the next phase cannot start until ActivityWatch monitoring recovers".to_string(),
+            ));
+        }
         session
             .timer
             .confirm_next(now)
             .map_err(ServiceError::Timer)?;
+        session.focus.reset();
         self.save_checkpoint(wall_now)?;
         self.state(now)
     }
@@ -188,8 +257,159 @@ impl PomodoroService {
             .timer
             .stop(CoreInterruptionReason::UserStopped)
             .map_err(ServiceError::Timer)?;
+        session.focus.reset();
         self.finalize(wall_now, Some(InterruptionReason::User))?;
         self.state(now)
+    }
+
+    pub fn observe_activity(
+        &mut self,
+        observation: ActivityObservation,
+        now: Instant,
+        wall_now: DateTime<Utc>,
+    ) -> Result<(), ServiceError> {
+        self.tick(now, wall_now)?;
+        if !self.has_active_session() {
+            return Ok(());
+        }
+
+        let session = self.active_session_mut()?;
+        session.monitoring_available = true;
+        session.afk = observation.afk;
+
+        if observation.afk {
+            session.focus.reset();
+            if matches!(session.timer.state(), TimerState::Running { .. }) {
+                session
+                    .timer
+                    .pause(now, PauseReason::Afk)
+                    .map_err(ServiceError::Timer)?;
+                self.pending_events.push(PomodoroEvent::AfkPaused);
+                self.save_checkpoint(wall_now)?;
+            }
+            return Ok(());
+        }
+
+        let is_focus = matches!(
+            session.timer.state(),
+            TimerState::Running {
+                phase: Phase::Focus { .. }
+            }
+        );
+        if !is_focus {
+            session.focus.reset();
+            return Ok(());
+        }
+
+        let category = observation.category.filter(|path| {
+            !path.is_empty() && path.first().is_some_and(|part| part != "Uncategorized")
+        });
+        let allowed = category
+            .as_ref()
+            .is_some_and(|path| category_is_allowed(path, &session.selected_categories));
+        let next_classification = if allowed {
+            FocusClassification::Allowed
+        } else {
+            FocusClassification::Distracted
+        };
+        let entering_distraction = session.focus.classification != FocusClassification::Distracted
+            && next_classification == FocusClassification::Distracted;
+        session.focus.classification = next_classification;
+        session.focus.current_category = category.clone();
+
+        if allowed {
+            session.focus.distracted_since = None;
+            session.focus.warning_pending = false;
+            return Ok(());
+        }
+
+        if entering_distraction {
+            session.focus.distracted_since = Some(now);
+            session.focus.warning_pending = false;
+            session.metrics.distraction_count = session.metrics.distraction_count.saturating_add(1);
+        }
+
+        let distracted_since = session.focus.distracted_since.get_or_insert(now);
+        let timeout = Duration::from_secs(session.settings.distraction_timeout_seconds);
+        let warning = if now.saturating_duration_since(*distracted_since) >= timeout {
+            session.focus.warning_sequence = session.focus.warning_sequence.saturating_add(1);
+            session.focus.warning_pending = true;
+            session.focus.distracted_since = Some(now);
+            let remaining_milliseconds = session
+                .timer
+                .remaining(now)
+                .map_err(ServiceError::Timer)?
+                .map_or(0, duration_milliseconds);
+            Some(PomodoroEvent::DistractionWarning {
+                sequence: session.focus.warning_sequence,
+                current_category: category,
+                remaining_milliseconds,
+            })
+        } else {
+            None
+        };
+        if let Some(warning) = warning {
+            self.pending_events.push(warning);
+        }
+        Ok(())
+    }
+
+    pub fn monitoring_failed(
+        &mut self,
+        now: Instant,
+        wall_now: DateTime<Utc>,
+    ) -> Result<(), ServiceError> {
+        self.tick(now, wall_now)?;
+        if !self.has_active_session() {
+            return Ok(());
+        }
+
+        let session = self.active_session_mut()?;
+        let was_available = session.monitoring_available;
+        session.monitoring_available = false;
+        session.focus.reset();
+        if was_available && matches!(session.timer.state(), TimerState::Running { .. }) {
+            session
+                .timer
+                .pause(now, PauseReason::MonitoringUnavailable)
+                .map_err(ServiceError::Timer)?;
+            self.pending_events
+                .push(PomodoroEvent::MonitoringUnavailablePaused);
+            self.save_checkpoint(wall_now)?;
+        }
+        Ok(())
+    }
+
+    pub fn acknowledge_distraction(
+        &mut self,
+        now: Instant,
+        wall_now: DateTime<Utc>,
+    ) -> Result<StateResponse, ServiceError> {
+        self.tick(now, wall_now)?;
+        let session = self.active_session_mut()?;
+        if !matches!(
+            session.timer.state(),
+            TimerState::Running {
+                phase: Phase::Focus { .. }
+            }
+        ) {
+            return Err(ServiceError::Conflict(
+                "there is no running focus distraction to continue".to_string(),
+            ));
+        }
+        if session.focus.warning_pending {
+            session.focus.warning_pending = false;
+            session.focus.distracted_since = Some(now);
+        }
+        self.state(now)
+    }
+
+    pub fn should_monitor(&self) -> bool {
+        self.has_active_session()
+    }
+
+    pub fn take_events(&mut self) -> Vec<PomodoroEvent> {
+        std::mem::take(&mut self.pending_events)
     }
 
     pub fn tick(&mut self, now: Instant, wall_now: DateTime<Utc>) -> Result<(), ServiceError> {
@@ -203,6 +423,12 @@ impl PomodoroService {
             .timer
             .tick(now)
             .map_err(ServiceError::Timer)?;
+
+        if event.is_some() {
+            if let Some(session) = self.current.as_mut() {
+                session.focus.reset();
+            }
+        }
 
         if matches!(
             self.current.as_ref().map(|session| session.timer.state()),
@@ -224,30 +450,35 @@ impl PomodoroService {
             return Ok(StateResponse::idle());
         };
         let timer_state = session.timer.state();
-        let (state, phase, next_phase, interruption_reason) = match timer_state {
-            TimerState::Ready => (PomodoroState::Idle, None, None, None),
+        let (state, phase, next_phase, pause_reason, interruption_reason) = match timer_state {
+            TimerState::Ready => (PomodoroState::Idle, None, None, None, None),
             TimerState::Running { phase } => {
                 let state = if matches!(phase, Phase::Focus { .. }) {
                     PomodoroState::RunningWork
                 } else {
                     PomodoroState::RunningBreak
                 };
-                (state, Some(phase_view(phase)), None, None)
+                (state, Some(phase_view(phase)), None, None, None)
             }
             TimerState::Paused { phase, reason } => {
-                let state = match reason {
-                    PauseReason::Manual => PomodoroState::PausedManual,
-                    PauseReason::Afk => PomodoroState::PausedAfk,
+                let (state, reason) = match reason {
+                    PauseReason::Manual => (PomodoroState::PausedManual, PauseReasonView::Manual),
+                    PauseReason::Afk => (PomodoroState::PausedAfk, PauseReasonView::Afk),
+                    PauseReason::MonitoringUnavailable => (
+                        PomodoroState::PausedManual,
+                        PauseReasonView::MonitoringUnavailable,
+                    ),
                 };
-                (state, Some(phase_view(phase)), None, None)
+                (state, Some(phase_view(phase)), None, Some(reason), None)
             }
             TimerState::WaitingForConfirmation { completed, next } => (
                 PomodoroState::WaitingConfirmation,
                 Some(phase_view(completed)),
                 Some(phase_view(next)),
                 None,
+                None,
             ),
-            TimerState::Completed => (PomodoroState::Completed, None, None, None),
+            TimerState::Completed => (PomodoroState::Completed, None, None, None, None),
             TimerState::Interrupted { reason } => {
                 let reason = match reason {
                     CoreInterruptionReason::UserStopped => InterruptionReason::User,
@@ -255,8 +486,19 @@ impl PomodoroService {
                         InterruptionReason::ActivitywatchRestart
                     }
                 };
-                (PomodoroState::Interrupted, None, None, Some(reason))
+                (PomodoroState::Interrupted, None, None, None, Some(reason))
             }
+        };
+
+        let distraction = DistractionView {
+            active: session.focus.classification == FocusClassification::Distracted,
+            elapsed_milliseconds: session
+                .focus
+                .distracted_since
+                .map(|since| duration_milliseconds(now.saturating_duration_since(since)))
+                .unwrap_or(0),
+            warning_pending: session.focus.warning_pending,
+            warning_sequence: session.focus.warning_sequence,
         };
 
         Ok(StateResponse {
@@ -272,8 +514,11 @@ impl PomodoroService {
             completed_focus_intervals: session.timer.completed_focus_intervals(),
             planned_focus_intervals: session.settings.work_intervals,
             selected_categories: session.selected_categories.clone(),
-            current_category: None,
-            distraction: Default::default(),
+            current_category: session.focus.current_category.clone(),
+            distraction,
+            afk: session.afk,
+            monitoring_available: session.monitoring_available,
+            pause_reason,
             interruption_reason,
         })
     }
@@ -357,7 +602,19 @@ impl PomodoroService {
         match timer_state {
             TimerState::Running {
                 phase: Phase::Focus { .. },
-            } => add_saturating(&mut session.metrics.actual_focus_milliseconds, milliseconds),
+            } => {
+                add_saturating(&mut session.metrics.actual_focus_milliseconds, milliseconds);
+                match session.focus.classification {
+                    FocusClassification::Allowed => add_saturating(
+                        &mut session.metrics.allowed_focus_milliseconds,
+                        milliseconds,
+                    ),
+                    FocusClassification::Distracted => {
+                        add_saturating(&mut session.metrics.distraction_milliseconds, milliseconds)
+                    }
+                    FocusClassification::Unknown => {}
+                }
+            }
             TimerState::Running { .. } => {
                 add_saturating(&mut session.metrics.actual_break_milliseconds, milliseconds)
             }
@@ -369,6 +626,13 @@ impl PomodoroService {
                 reason: PauseReason::Afk,
                 ..
             } => add_saturating(&mut session.metrics.afk_pause_milliseconds, milliseconds),
+            TimerState::Paused {
+                reason: PauseReason::MonitoringUnavailable,
+                ..
+            } => add_saturating(
+                &mut session.metrics.monitoring_pause_milliseconds,
+                milliseconds,
+            ),
             _ => {}
         }
     }
@@ -494,17 +758,13 @@ fn history_from_parts(
     completed_focus_intervals: u32,
     metrics: PersistedMetrics,
 ) -> SessionHistory {
-    let focus_percentage = if metrics.actual_focus_milliseconds == 0
-        || (metrics.allowed_focus_milliseconds == 0
-            && metrics.distraction_count == 0
-            && metrics.distraction_milliseconds == 0)
-    {
+    let classified_focus = metrics
+        .allowed_focus_milliseconds
+        .saturating_add(metrics.distraction_milliseconds);
+    let focus_percentage = if classified_focus == 0 {
         None
     } else {
-        Some(
-            metrics.allowed_focus_milliseconds as f64 / metrics.actual_focus_milliseconds as f64
-                * 100.0,
-        )
+        Some(metrics.allowed_focus_milliseconds as f64 / classified_focus as f64 * 100.0)
     };
     SessionHistory {
         session_id,
@@ -520,6 +780,7 @@ fn history_from_parts(
         actual_break_milliseconds: metrics.actual_break_milliseconds,
         manual_pause_milliseconds: metrics.manual_pause_milliseconds,
         afk_pause_milliseconds: metrics.afk_pause_milliseconds,
+        monitoring_pause_milliseconds: metrics.monitoring_pause_milliseconds,
         distraction_count: metrics.distraction_count,
         distraction_milliseconds: metrics.distraction_milliseconds,
         allowed_focus_milliseconds: metrics.allowed_focus_milliseconds,

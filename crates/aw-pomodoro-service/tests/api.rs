@@ -2,8 +2,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use aw_pomodoro_service::{
-    ApiRequest, HistoryError, HistoryStore, PomodoroApi, PomodoroService, PomodoroSettings,
-    SessionHistory,
+    ActivityObservation, ApiRequest, HistoryError, HistoryStore, PomodoroApi, PomodoroService,
+    PomodoroSettings, SessionHistory,
 };
 use chrono::{TimeZone, Utc};
 use serde_json::{json, Value};
@@ -559,6 +559,20 @@ fn missing_categories_and_invalid_ranges_are_rejected() {
         .unwrap()
         .contains("at least one category"));
 
+    let (status, response) = call(
+        &mut api,
+        "POST",
+        "/pomodoro/start",
+        json!({"selected_categories": [["Uncategorized"]]}),
+        now,
+        wall,
+    );
+    assert_eq!(status, 400);
+    assert!(response["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("Uncategorized cannot be selected"));
+
     let settings = PomodoroSettings {
         work_intervals: 0,
         ..PomodoroSettings::default()
@@ -572,4 +586,50 @@ fn missing_categories_and_invalid_ranges_are_rejected() {
         wall,
     );
     assert_eq!(status, 400);
+}
+
+#[test]
+fn distraction_continue_endpoint_acknowledges_only_the_pending_warning() {
+    let temp = TempDir::new().unwrap();
+    let mut api = open_api(&temp, MemoryHistory::default());
+    let now = Instant::now();
+    let wall = wall_clock();
+    let mut body = start_body(2);
+    body["settings"]["focus_duration_seconds"] = json!(10);
+    assert_eq!(
+        call(&mut api, "POST", "/pomodoro/start", body, now, wall,).0,
+        200
+    );
+    api.observe_activity_at(ActivityObservation::active(None), now, wall)
+        .unwrap();
+    api.observe_activity_at(
+        ActivityObservation::active(None),
+        now + Duration::from_secs(1),
+        wall + chrono::Duration::seconds(1),
+    )
+    .unwrap();
+
+    let (status, acknowledged) = call(
+        &mut api,
+        "POST",
+        "/pomodoro/distraction/continue",
+        json!({}),
+        now + Duration::from_secs(1),
+        wall + chrono::Duration::seconds(1),
+    );
+    assert_eq!(status, 200);
+    assert_eq!(acknowledged["distraction"]["warning_pending"], false);
+    assert_eq!(acknowledged["distraction"]["warning_sequence"], 1);
+
+    let (status, repeated) = call(
+        &mut api,
+        "POST",
+        "/pomodoro/distraction/continue",
+        json!({}),
+        now + Duration::from_millis(1_500),
+        wall + chrono::Duration::milliseconds(1_500),
+    );
+    assert_eq!(status, 200);
+    assert_eq!(repeated["distraction"]["warning_pending"], false);
+    assert_eq!(repeated["distraction"]["warning_sequence"], 1);
 }
