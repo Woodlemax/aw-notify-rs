@@ -36,7 +36,13 @@ impl HistoryStore for MemoryHistory {
 fn open_api(temp: &TempDir, history: MemoryHistory) -> PomodoroApi {
     let service =
         PomodoroService::open(temp.path().join("pomodoro-state.json"), Box::new(history)).unwrap();
-    PomodoroApi::new(service, vec![ALLOWED_ORIGIN.to_string()])
+    PomodoroApi::new(
+        service,
+        vec![
+            ALLOWED_ORIGIN.to_string(),
+            "chrome-extension://*".to_string(),
+        ],
+    )
 }
 
 fn call(
@@ -195,6 +201,24 @@ fn loopback_api_rejects_untrusted_origins_and_unsafe_content_types() {
         wall,
     );
     assert_eq!(preflight.status_code, 204);
+
+    let chrome_origin = "chrome-extension://abcdefghijklmnopabcdefghijklmnop";
+    let extension_request = api.handle_at(
+        ApiRequest {
+            method: "GET",
+            url: "/pomodoro/notifications?after=0",
+            origin: Some(chrome_origin),
+            content_type: None,
+            body: &[],
+        },
+        now,
+        wall,
+    );
+    assert_eq!(extension_request.status_code, 200);
+    assert_eq!(
+        extension_request.allow_origin.as_deref(),
+        Some(chrome_origin)
+    );
 }
 
 #[test]
@@ -632,4 +656,70 @@ fn distraction_continue_endpoint_acknowledges_only_the_pending_warning() {
     assert_eq!(status, 200);
     assert_eq!(repeated["distraction"]["warning_pending"], false);
     assert_eq!(repeated["distraction"]["warning_sequence"], 1);
+}
+
+#[test]
+fn chrome_notification_queue_supports_cursor_and_idempotent_actions() {
+    let temp = TempDir::new().unwrap();
+    let mut api = open_api(&temp, MemoryHistory::default());
+    let now = Instant::now();
+    let wall = wall_clock();
+    let mut body = start_body(2);
+    body["settings"]["focus_duration_seconds"] = json!(10);
+    body["settings"]["chrome_notifications"] = json!(true);
+    call(&mut api, "POST", "/pomodoro/start", body, now, wall);
+
+    api.observe_activity_at(ActivityObservation::active(None), now, wall)
+        .unwrap();
+    api.observe_activity_at(
+        ActivityObservation::active(None),
+        now + Duration::from_secs(1),
+        wall + chrono::Duration::seconds(1),
+    )
+    .unwrap();
+
+    let (status, page) = call(
+        &mut api,
+        "GET",
+        "/pomodoro/notifications?after=0",
+        Value::Null,
+        now + Duration::from_secs(1),
+        wall + chrono::Duration::seconds(1),
+    );
+    assert_eq!(status, 200);
+    assert_eq!(page["items"].as_array().unwrap().len(), 1);
+    assert_eq!(page["items"][0]["event"]["type"], "distraction_warning");
+    let notification_id = page["items"][0]["id"].as_u64().unwrap();
+    assert_eq!(page["latest_id"], notification_id);
+
+    let (status, action) = call(
+        &mut api,
+        "POST",
+        &format!("/pomodoro/notifications/{notification_id}/action"),
+        json!({"action": "pause"}),
+        now + Duration::from_secs(1),
+        wall + chrono::Duration::seconds(1),
+    );
+    assert_eq!(status, 200);
+    assert_eq!(action["applied"], true);
+
+    let (_, repeated) = call(
+        &mut api,
+        "POST",
+        &format!("/pomodoro/notifications/{notification_id}/action"),
+        json!({"action": "pause"}),
+        now + Duration::from_secs(1),
+        wall + chrono::Duration::seconds(1),
+    );
+    assert_eq!(repeated["applied"], false);
+
+    let (_, after) = call(
+        &mut api,
+        "GET",
+        &format!("/pomodoro/notifications?after={notification_id}"),
+        Value::Null,
+        now + Duration::from_secs(1),
+        wall + chrono::Duration::seconds(1),
+    );
+    assert!(after["items"].as_array().unwrap().is_empty());
 }

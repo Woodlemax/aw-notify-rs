@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::fmt;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -11,8 +11,8 @@ use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
 use crate::focus::{
-    category_is_allowed, ActivityObservation, PomodoroActionToken, PomodoroEvent,
-    PomodoroNotificationAction, PomodoroNotificationOptions,
+    category_is_allowed, ActivityObservation, ChromeNotification, ChromeNotificationPage,
+    PomodoroActionToken, PomodoroEvent, PomodoroNotificationAction, PomodoroNotificationOptions,
 };
 use crate::history::HistoryStore;
 use crate::model::{
@@ -23,6 +23,7 @@ use crate::model::{
 use crate::persistence::{FileStateStore, PersistedMetrics, PersistedState, SessionCheckpoint};
 
 const CHECKPOINT_INTERVAL: Duration = Duration::from_secs(1);
+const MAX_CHROME_NOTIFICATIONS: usize = 100;
 
 pub struct PomodoroService {
     file_store: FileStateStore,
@@ -30,6 +31,9 @@ pub struct PomodoroService {
     history_store: Box<dyn HistoryStore>,
     current: Option<RuntimeSession>,
     pending_events: Vec<PomodoroEvent>,
+    chrome_notifications: VecDeque<ChromeNotification>,
+    next_chrome_notification_id: u64,
+    notification_instance_id: String,
 }
 
 struct RuntimeSession {
@@ -104,6 +108,9 @@ impl PomodoroService {
             history_store,
             current: None,
             pending_events: Vec::new(),
+            chrome_notifications: VecDeque::new(),
+            next_chrome_notification_id: 1,
+            notification_instance_id: Uuid::new_v4().to_string(),
         };
         service.flush_pending_history();
         Ok(service)
@@ -291,7 +298,7 @@ impl PomodoroService {
                     session_id: session.session_id.clone(),
                     notifications: notification_options(&session.settings),
                 };
-                self.pending_events.push(event);
+                self.emit_event(event);
                 self.save_checkpoint(wall_now)?;
             }
             return Ok(());
@@ -358,7 +365,7 @@ impl PomodoroService {
             None
         };
         if let Some(warning) = warning {
-            self.pending_events.push(warning);
+            self.emit_event(warning);
         }
         Ok(())
     }
@@ -386,7 +393,7 @@ impl PomodoroService {
                 session_id: session.session_id.clone(),
                 notifications: notification_options(&session.settings),
             };
-            self.pending_events.push(event);
+            self.emit_event(event);
             self.save_checkpoint(wall_now)?;
         }
         Ok(())
@@ -422,6 +429,37 @@ impl PomodoroService {
 
     pub fn take_events(&mut self) -> Vec<PomodoroEvent> {
         std::mem::take(&mut self.pending_events)
+    }
+
+    pub fn chrome_notifications_after(&self, after: u64) -> ChromeNotificationPage {
+        ChromeNotificationPage {
+            items: self
+                .chrome_notifications
+                .iter()
+                .filter(|notification| notification.id > after)
+                .cloned()
+                .collect(),
+            latest_id: self.next_chrome_notification_id.saturating_sub(1),
+            instance_id: self.notification_instance_id.clone(),
+        }
+    }
+
+    pub fn apply_chrome_notification_action(
+        &mut self,
+        notification_id: u64,
+        action: PomodoroNotificationAction,
+        now: Instant,
+        wall_now: DateTime<Utc>,
+    ) -> Result<bool, ServiceError> {
+        let token = self
+            .chrome_notifications
+            .iter()
+            .find(|notification| notification.id == notification_id)
+            .and_then(|notification| notification.event.action_token());
+        let Some(token) = token else {
+            return Ok(false);
+        };
+        self.apply_notification_action(&token, action, now, wall_now)
     }
 
     /// Apply a button click from a desktop notification only if the notification
@@ -499,7 +537,7 @@ impl PomodoroService {
                 _ => None,
             });
             if let Some(notification_event) = notification_event {
-                self.pending_events.push(notification_event);
+                self.emit_event(notification_event);
             }
         }
 
@@ -516,6 +554,20 @@ impl PomodoroService {
             self.save_checkpoint(wall_now)?;
         }
         Ok(())
+    }
+
+    fn emit_event(&mut self, event: PomodoroEvent) {
+        if event.chrome_notifications_enabled() {
+            self.chrome_notifications.push_back(ChromeNotification {
+                id: self.next_chrome_notification_id,
+                event: event.clone(),
+            });
+            self.next_chrome_notification_id = self.next_chrome_notification_id.saturating_add(1);
+            while self.chrome_notifications.len() > MAX_CHROME_NOTIFICATIONS {
+                self.chrome_notifications.pop_front();
+            }
+        }
+        self.pending_events.push(event);
     }
 
     pub fn state(&self, now: Instant) -> Result<StateResponse, ServiceError> {

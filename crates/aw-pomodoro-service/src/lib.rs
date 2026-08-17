@@ -11,8 +11,8 @@ mod service;
 
 pub use api::{ApiRequest, ApiResponse, PomodoroApi};
 pub use focus::{
-    category_is_allowed, ActivityObservation, PomodoroActionToken, PomodoroEvent,
-    PomodoroNotificationAction, PomodoroNotificationOptions,
+    category_is_allowed, ActivityObservation, ChromeNotification, ChromeNotificationPage,
+    PomodoroActionToken, PomodoroEvent, PomodoroNotificationAction, PomodoroNotificationOptions,
 };
 pub use history::{HistoryError, HistoryStore};
 pub use model::{
