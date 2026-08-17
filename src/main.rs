@@ -148,6 +148,7 @@ impl Default for NotificationConfig {
                 "http://localhost:5600".to_string(),
                 "http://127.0.0.1:5666".to_string(),
                 "http://localhost:5666".to_string(),
+                "chrome-extension://*".to_string(),
             ],
         }
     }

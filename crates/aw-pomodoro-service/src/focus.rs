@@ -57,6 +57,67 @@ pub enum PomodoroEvent {
     },
 }
 
+impl PomodoroEvent {
+    pub fn chrome_notifications_enabled(&self) -> bool {
+        match self {
+            Self::DistractionWarning { notifications, .. }
+            | Self::PhaseCompleted { notifications, .. }
+            | Self::SessionCompleted { notifications, .. }
+            | Self::AfkPaused { notifications, .. }
+            | Self::MonitoringUnavailablePaused { notifications, .. } => {
+                notifications.chrome_notifications
+            }
+        }
+    }
+
+    pub fn action_token(&self) -> Option<PomodoroActionToken> {
+        match self {
+            Self::DistractionWarning {
+                session_id,
+                sequence,
+                ..
+            } => Some(PomodoroActionToken::Distraction {
+                session_id: session_id.clone(),
+                sequence: *sequence,
+            }),
+            Self::PhaseCompleted {
+                session_id,
+                completed,
+                next,
+                ..
+            } => Some(PomodoroActionToken::PhaseCompleted {
+                session_id: session_id.clone(),
+                completed: completed.clone(),
+                next: next.clone(),
+            }),
+            Self::AfkPaused { session_id, .. } => Some(PomodoroActionToken::Paused {
+                session_id: session_id.clone(),
+                reason: PauseReasonView::Afk,
+            }),
+            Self::MonitoringUnavailablePaused { session_id, .. } => {
+                Some(PomodoroActionToken::Paused {
+                    session_id: session_id.clone(),
+                    reason: PauseReasonView::MonitoringUnavailable,
+                })
+            }
+            Self::SessionCompleted { .. } => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChromeNotification {
+    pub id: u64,
+    pub event: PomodoroEvent,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChromeNotificationPage {
+    pub items: Vec<ChromeNotification>,
+    pub latest_id: u64,
+    pub instance_id: String,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PomodoroNotificationOptions {
     pub system_notifications: bool,

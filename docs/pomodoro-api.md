@@ -42,9 +42,51 @@ Successful responses use JSON. Errors use this shape:
 | `GET` | `/settings` | Read saved defaults and the last category selection. |
 | `PUT` | `/settings` | Validate and save defaults. Rejected during an active session. |
 | `GET` | `/history?page=1&page_size=20` | Read newest-first paginated history. |
+| `GET` | `/notifications?after=42` | Read Chrome notification events newer than cursor `42`. |
+| `POST` | `/notifications/43/action` | Apply an action from Chrome notification `43`. |
 
-Notification queue endpoints are intentionally deferred to the Chrome
-integration stage.
+## Chrome notification queue
+
+`GET /notifications?after=42` returns a bounded in-memory queue:
+
+```json
+{
+  "instance_id": "45c73b80-d264-4d5f-b78f-623cb8faf6b5",
+  "latest_id": 43,
+  "items": [
+    {
+      "id": 43,
+      "event": {
+        "type": "distraction_warning",
+        "session_id": "session-id",
+        "sequence": 2,
+        "remaining_milliseconds": 1200000,
+        "notifications": {
+          "system_notifications": true,
+          "chrome_notifications": true,
+          "sound_enabled": true
+        }
+      }
+    }
+  ]
+}
+```
+
+The extension stores both `instance_id` and `latest_id`. A changed instance ID
+means `aw-notify` restarted, so the extension safely resets its cursor. Only
+events with `chrome_notifications = true` enter this queue, and the newest 100
+events are retained.
+
+Actions use JSON and are validated against the exact session/warning/phase
+represented by the notification:
+
+```json
+{ "action": "pause" }
+```
+
+Allowed values are `continue`, `pause`, and `stop`. The response is
+`{"applied":true}` only for a current valid action. Repeated or stale actions
+return `{"applied":false}` without changing timer state.
 
 ## Settings
 

@@ -1,7 +1,7 @@
 use std::time::Instant;
 
 use chrono::{DateTime, Utc};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::model::{PomodoroSettings, StartRequest};
@@ -132,6 +132,29 @@ impl PomodoroApi {
                     .acknowledge_distraction(now, wall_now)
                     .map(JsonBody::new)
             }
+            ("GET", "/pomodoro/notifications") => parse_notifications_query(query)
+                .map(|after| self.service.chrome_notifications_after(after))
+                .map(JsonBody::new),
+            ("POST", path) if path.starts_with("/pomodoro/notifications/") => {
+                if let Err(response) = require_json_content_type(request, allow_origin.clone()) {
+                    return response;
+                }
+                parse_notification_action_path(path)
+                    .and_then(|notification_id| {
+                        parse_json::<NotificationActionRequest>(request.body)
+                            .map_err(ServiceError::Validation)
+                            .map(|body| (notification_id, body.action))
+                    })
+                    .and_then(|(notification_id, action)| {
+                        self.service.apply_chrome_notification_action(
+                            notification_id,
+                            action,
+                            now,
+                            wall_now,
+                        )
+                    })
+                    .map(|applied| JsonBody::new(json!({ "applied": applied })))
+            }
             ("GET", "/pomodoro/history") => parse_history_query(query)
                 .and_then(|(page, page_size)| self.service.history(page, page_size))
                 .map(JsonBody::new),
@@ -209,7 +232,11 @@ impl PomodoroApi {
         let Some(origin) = origin else {
             return Ok(None);
         };
-        if self.allowed_origins.iter().any(|allowed| allowed == origin) {
+        if self
+            .allowed_origins
+            .iter()
+            .any(|allowed| origin_matches(allowed, origin))
+        {
             return Ok(Some(origin.to_string()));
         }
         Err(self.error(
@@ -258,6 +285,11 @@ impl PomodoroApi {
 
 struct JsonBody {
     value: Value,
+}
+
+#[derive(Debug, Deserialize)]
+struct NotificationActionRequest {
+    action: PomodoroNotificationAction,
 }
 
 impl JsonBody {
@@ -342,4 +374,54 @@ fn parse_history_query(query: Option<&str>) -> Result<(u64, u64), ServiceError> 
         }
     }
     Ok((page, page_size))
+}
+
+fn parse_notifications_query(query: Option<&str>) -> Result<u64, ServiceError> {
+    let mut after = 0;
+    if let Some(query) = query {
+        for pair in query.split('&').filter(|pair| !pair.is_empty()) {
+            let (key, value) = pair.split_once('=').ok_or_else(|| {
+                ServiceError::Validation("invalid notifications query string".to_string())
+            })?;
+            match key {
+                "after" => {
+                    after = value.parse().map_err(|_| {
+                        ServiceError::Validation("after must be an integer".to_string())
+                    })?;
+                }
+                _ => {
+                    return Err(ServiceError::Validation(format!(
+                        "unknown notifications query parameter: {key}"
+                    )));
+                }
+            }
+        }
+    }
+    Ok(after)
+}
+
+fn parse_notification_action_path(path: &str) -> Result<u64, ServiceError> {
+    let id = path
+        .strip_prefix("/pomodoro/notifications/")
+        .and_then(|value| value.strip_suffix("/action"))
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| ServiceError::Validation("invalid notification action path".to_string()))?;
+    id.parse()
+        .map_err(|_| ServiceError::Validation("notification id must be an integer".to_string()))
+}
+
+fn origin_matches(allowed: &str, origin: &str) -> bool {
+    if allowed == origin {
+        return true;
+    }
+    if allowed != "chrome-extension://*" {
+        return false;
+    }
+    let Some(extension_id) = origin.strip_prefix("chrome-extension://") else {
+        return false;
+    };
+    extension_id.len() == 32
+        && extension_id
+            .bytes()
+            .all(|character| (b'a'..=b'p').contains(&character))
 }

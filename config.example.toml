@@ -24,13 +24,15 @@ productivity_score = true
 # Set to 0 only if both local APIs should be disabled.
 http_port = 5667
 
-# Browser origins allowed to access /pomodoro. Requests without Origin remain
-# available to native clients and manual command-line checks on this computer.
+# Browser origins allowed to access /pomodoro. The Chrome wildcard only accepts
+# syntactically valid extension IDs; the API remains bound to loopback. Requests
+# without Origin remain available to native clients and local manual checks.
 pomodoro_allowed_origins = [
     "http://127.0.0.1:5600",
     "http://localhost:5600",
     "http://127.0.0.1:5666",
     "http://localhost:5666",
+    "chrome-extension://*",
 ]
 
 # Category alerts configuration
