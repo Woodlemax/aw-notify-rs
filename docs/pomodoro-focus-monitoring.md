@@ -45,9 +45,9 @@ user remains distracted. `/pomodoro/distraction/continue` acknowledges only the
 currently pending warning; repeated calls are idempotent and do not postpone the
 next warning.
 
-Pause and Stop use the normal Pomodoro endpoints. The notification transports
-that expose these actions in Windows and Chrome are intentionally implemented
-in later stages.
+Pause and Stop use the normal Pomodoro commands. Windows Toast buttons are
+implemented by `aw-notify`; Chrome delivery remains a separate integration.
+See [Pomodoro Windows notifications](pomodoro-windows-notifications.md).
 
 ## AFK
 
