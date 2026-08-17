@@ -1,0 +1,10 @@
+[package]
+name = "aw-pomodoro-core"
+version = "0.1.0"
+edition = "2021"
+description = "Deterministic Pomodoro state machine for ActivityWatch"
+authors = ["ActivityWatch Contributors"]
+repository = "https://github.com/ActivityWatch/aw-notify-rs"
+license = "MPL-2.0"
+
+[dependencies]

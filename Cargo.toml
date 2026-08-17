@@ -11,7 +11,7 @@ keywords = ["activitywatch", "time-tracking", "notifications"]
 categories = ["gui"]
 
 [workspace]
-members = ["crates/aw-notify-client"]
+members = ["crates/aw-notify-client", "crates/aw-pomodoro-core"]
 
 [[bin]]
 name = "aw-notify"
